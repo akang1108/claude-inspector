@@ -1,1 +1,16 @@
+# Rust
 target/
+**/*.rs.bk
+*.pdb
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+*.swp
+
+# OS
+.DS_Store
+
+# Local env
+.env
