@@ -1,6 +1,9 @@
 # claude-inspector
 
-TUI to browse Claude Code memory across config dirs.
+TUI to inspect Claude Code settings and context across config dirs.
+
+- Started as a way to surface hidden memory
+- Covers instruction files, imports, auto memory, skills, settings, and sessions
 
 ## Usage
 
@@ -12,15 +15,3 @@ TUI to browse Claude Code memory across config dirs.
 - Honors `CLAUDE_CONFIG_DIR`, else `~/.claude`
 - Add more with `-c <dir>` (repeatable), e.g. `make run ARGS="-c ~/.claude-me"`
 - Sibling `~/.claude*` installs are auto-discovered; disable with `--no-discover`
-
-## Keys
-
-| Key               | Action           |
-| :---------------- | :--------------- |
-| `j` / `k`         | Move             |
-| `J` / `K`         | Scroll preview   |
-| `Tab` / `h` / `l` | Switch scope tab |
-| `[` / `]`         | Switch install   |
-| `/`               | Text filter      |
-| `r`               | Rescan           |
-| `q`               | Quit             |

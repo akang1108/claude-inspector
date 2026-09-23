@@ -290,8 +290,11 @@ fn scope_color(s: Scope) -> Color {
         Scope::Managed => Color::Red,
         Scope::Global => Color::Magenta,
         Scope::Repo => Color::Green,
+        Scope::Ancestor => Color::LightGreen,
+        Scope::Import => Color::Blue,
         Scope::ProjectMemory => Color::Cyan,
-        Scope::Session => Color::Yellow,
+        Scope::Extra => Color::Yellow,
+        Scope::Session => Color::LightYellow,
     }
 }
 

@@ -14,31 +14,40 @@ pub enum Scope {
     Managed,
     Global,
     Repo,
+    Ancestor,
+    Import,
     ProjectMemory,
+    Extra,
     Session,
 }
 
 impl Scope {
-    pub const ALL: [Scope; 5] = [
+    pub const ALL: [Scope; 8] = [
         Scope::Managed,
         Scope::Global,
         Scope::Repo,
+        Scope::Ancestor,
+        Scope::Import,
         Scope::ProjectMemory,
+        Scope::Extra,
         Scope::Session,
     ];
 
     pub fn title(self) -> &'static str {
         match self {
-            Scope::Managed => "Managed policy",
-            Scope::Global => "Global (user)",
-            Scope::Repo => "Repo instructions",
+            Scope::Managed => "Managed",
+            Scope::Global => "Global",
+            Scope::Repo => "Repo",
+            Scope::Ancestor => "Parent dirs",
+            Scope::Import => "Imports",
             Scope::ProjectMemory => "Auto memory",
+            Scope::Extra => "Skills & settings",
             Scope::Session => "Sessions",
         }
     }
 
     pub fn per_project(self) -> bool {
-        matches!(self, Scope::Repo | Scope::ProjectMemory | Scope::Session)
+        !matches!(self, Scope::Managed | Scope::Global)
     }
 }
 
@@ -148,7 +157,7 @@ pub fn scan(dir: &Path, from_env: bool) -> Install {
     for pdir in projects {
         let slug = pdir.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let sessions = session_files(&pdir);
-        let cwd = sessions.iter().take(5).find_map(|(p, _)| project_cwd(p));
+        let cwd = sessions.iter().take(5).find_map(|p| project_cwd(p));
         let group = cwd.clone().unwrap_or_else(|| slug.clone());
 
         let mut mem = md_files_recursive(&pdir.join("memory"));
@@ -172,20 +181,27 @@ pub fn scan(dir: &Path, from_env: bool) -> Install {
             }
         }
 
-        for (path, modified) in sessions {
+        if let Some(cwd) = &cwd {
+            add_extras(&mut entries, &group, &PathBuf::from(cwd).join(".claude"));
+        }
+
+        for path in sessions {
             let id = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
-            let title = first_prompt(&path).unwrap_or_else(|| id.clone());
-            let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let meta = fs::metadata(&path).ok();
             entries.push(Entry {
                 scope: Scope::Session,
                 group: group.clone(),
-                name: title,
+                name: first_prompt(&path).unwrap_or(id),
+                size: meta.as_ref().map_or(0, |m| m.len()),
+                modified: meta.and_then(|m| m.modified().ok()),
                 path,
-                size,
-                modified,
             });
         }
     }
+
+    add_extras(&mut entries, &dir.display().to_string(), dir);
+    add_ancestors(&mut entries);
+    add_imports(&mut entries);
 
     entries.sort_by_key(|e| (e.scope as u8, e.group.clone()));
     Install { dir: dir.to_path_buf(), from_env, entries }
@@ -223,8 +239,8 @@ fn md_files_recursive(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Top-level transcripts only; subagent logs live in nested dirs.
-fn session_files(pdir: &Path) -> Vec<(PathBuf, Option<SystemTime>)> {
+/// Newest first; only top-level transcripts, since subagent logs live in nested dirs.
+fn session_files(pdir: &Path) -> Vec<PathBuf> {
     let mut v: Vec<_> = fs::read_dir(pdir)
         .into_iter()
         .flatten()
@@ -237,15 +253,125 @@ fn session_files(pdir: &Path) -> Vec<(PathBuf, Option<SystemTime>)> {
         })
         .collect();
     v.sort_by(|a, b| b.1.cmp(&a.1));
-    v
+    v.into_iter().map(|(p, _)| p).collect()
 }
 
+/// The project dir name is a lossy encoding of the path, so the real cwd comes from the transcript.
 fn project_cwd(jsonl: &Path) -> Option<String> {
     let f = fs::File::open(jsonl).ok()?;
     BufReader::new(f).lines().take(60).flatten().find_map(|l| {
         let v: Value = serde_json::from_str(&l).ok()?;
         v.get("cwd")?.as_str().map(str::to_owned)
     })
+}
+
+/// Skills, commands, agents, output styles and settings under a `.claude`-style dir.
+fn add_extras(entries: &mut Vec<Entry>, group: &str, base: &Path) {
+    for rel in ["settings.json", "settings.local.json"] {
+        add_file(entries, Scope::Extra, group, base.join(rel), rel.into());
+    }
+    for sub in ["skills", "commands", "agents", "output-styles"] {
+        let root = base.join(sub);
+        for f in md_files_recursive(&root) {
+            // Skill folders also hold reference docs that are not loaded on their own.
+            if sub == "skills" && f.file_name().is_none_or(|n| n != "SKILL.md") {
+                continue;
+            }
+            let name = format!("{sub}/{}", f.strip_prefix(&root).unwrap_or(&f).display());
+            add_file(entries, Scope::Extra, group, f, name);
+        }
+    }
+}
+
+/// CLAUDE.md files above a project's cwd are loaded too, and are easy to forget about.
+fn add_ancestors(entries: &mut Vec<Entry>) {
+    let mut seen: HashSet<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
+    let roots: HashSet<PathBuf> = entries
+        .iter()
+        .filter(|e| e.scope == Scope::Repo)
+        .map(|e| PathBuf::from(&e.group))
+        .collect();
+    let mut found = Vec::new();
+    for root in roots {
+        for anc in root.ancestors().skip(1).filter(|a| a.parent().is_some()) {
+            for f in ["CLAUDE.md", "CLAUDE.local.md"] {
+                let p = anc.join(f);
+                if seen.insert(p.clone()) {
+                    add_file(&mut found, Scope::Ancestor, &anc.display().to_string(), p, f.into());
+                }
+            }
+        }
+    }
+    entries.extend(found);
+}
+
+/// Follows `@path` imports in every instruction file, so nested includes show up as their own entries.
+fn add_imports(entries: &mut Vec<Entry>) {
+    let roots: Vec<PathBuf> = entries
+        .iter()
+        .filter(|e| matches!(e.scope, Scope::Managed | Scope::Global | Scope::Repo | Scope::Ancestor))
+        .map(|e| e.path.clone())
+        .collect();
+    let mut found = Vec::new();
+    for root in roots {
+        let group = root.display().to_string();
+        let mut seen = HashSet::from([root.clone()]);
+        collect_imports(&root, &group, 0, &mut seen, &mut found);
+    }
+    entries.extend(found);
+}
+
+fn collect_imports(file: &Path, group: &str, depth: u8, seen: &mut HashSet<PathBuf>, out: &mut Vec<Entry>) {
+    if depth >= 5 {
+        return;
+    }
+    let text = read_capped(file);
+    let base = file.parent().unwrap_or(Path::new("/"));
+    let mut in_fence = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+        }
+        if in_fence {
+            continue;
+        }
+        for tok in line.split_whitespace() {
+            let Some(raw) = tok.strip_prefix('@') else { continue };
+            let raw = raw.trim_end_matches(|c: char| ",.;:)\"'`".contains(c));
+            if raw.is_empty() || !(raw.contains('/') || raw.contains('.')) {
+                continue;
+            }
+            let path = match raw.strip_prefix("~/") {
+                Some(rest) => home().join(rest),
+                None if raw.starts_with('/') => PathBuf::from(raw),
+                None => base.join(raw),
+            };
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            match fs::metadata(&path) {
+                Ok(m) if m.is_file() => {
+                    out.push(Entry {
+                        scope: Scope::Import,
+                        group: group.to_string(),
+                        name: format!("@{raw}"),
+                        size: m.len(),
+                        modified: m.modified().ok(),
+                        path: path.clone(),
+                    });
+                    collect_imports(&path, group, depth + 1, seen, out);
+                }
+                _ => out.push(Entry {
+                    scope: Scope::Import,
+                    group: group.to_string(),
+                    name: format!("@{raw} (missing)"),
+                    size: 0,
+                    modified: None,
+                    path,
+                }),
+            }
+        }
+    }
 }
 
 fn message_text(v: &Value) -> Option<(String, String)> {
@@ -256,8 +382,7 @@ fn message_text(v: &Value) -> Option<(String, String)> {
     if v.get("isMeta").and_then(Value::as_bool) == Some(true) {
         return None;
     }
-    let content = v.get("message")?.get("content")?;
-    let text = match content {
+    let text = match v.get("message")?.get("content")? {
         Value::String(s) => s.clone(),
         Value::Array(blocks) => blocks
             .iter()
@@ -277,7 +402,8 @@ fn first_prompt(jsonl: &Path) -> Option<String> {
         let v: Value = serde_json::from_str(&l).ok()?;
         let (kind, text) = message_text(&v)?;
         // Slash-command and hook wrappers are XML-ish, not the user's own words.
-        (kind == "user" && !text.starts_with('<')).then(|| text.lines().next().unwrap_or("").chars().take(80).collect())
+        (kind == "user" && !text.starts_with('<'))
+            .then(|| text.lines().next().unwrap_or("").chars().take(80).collect())
     })
 }
 
@@ -286,14 +412,6 @@ pub fn load(entry: &Entry) -> String {
         return render_session(&entry.path);
     }
     read_capped(&entry.path)
-}
-
-fn read_capped(path: &Path) -> String {
-    let mut buf = Vec::new();
-    match fs::File::open(path).and_then(|f| f.take(MAX_READ).read_to_end(&mut buf)) {
-        Ok(_) => String::from_utf8_lossy(&buf).into_owned(),
-        Err(e) => format!("cannot read {}: {e}", path.display()),
-    }
 }
 
 fn render_session(path: &Path) -> String {
@@ -316,5 +434,13 @@ fn render_session(path: &Path) -> String {
         "(no user/assistant text found)".into()
     } else {
         out
+    }
+}
+
+fn read_capped(path: &Path) -> String {
+    let mut buf = Vec::new();
+    match fs::File::open(path).and_then(|f| f.take(MAX_READ).read_to_end(&mut buf)) {
+        Ok(_) => String::from_utf8_lossy(&buf).into_owned(),
+        Err(e) => format!("cannot read {}: {e}", path.display()),
     }
 }
